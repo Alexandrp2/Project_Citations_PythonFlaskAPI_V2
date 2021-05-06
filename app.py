@@ -2,11 +2,15 @@ from flask import Flask, request, Response, jsonify, json, session
 from flask_session import Session
 from flask_pymongo import PyMongo, MongoClient
 from flask_cors import CORS
+import smtplib, email.mime.multipart, email.mime.text
 from bson.json_util import dumps
 from bson import ObjectId
 from argon2 import PasswordHasher, exceptions
 from datetime import timedelta, datetime
+import uuid
 import base64, binascii
+from sessionManager import SessionManager
+from mailManager import MailManager
 
 
 app = Flask(__name__)
@@ -47,96 +51,47 @@ app.config['SESSION_MONGODB_COLLECT'] = "sessions"
 app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_PERMANENT'] = True
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=131)
+# For a 1 minute validity session, set minutes=121 (date is not the same format before database & this API)
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=122)
 # if SESSION_USE_SIGNER set to True, you have to set flask.Flask.secret_key
 app.config['SESSION_USE_SIGNER'] = True 
 
 Session(app)
 
+sessMgr = SessionManager(mongo)
+mailMgr = MailManager()
 ph = PasswordHasher()
 
-@app.route('/', methods=['GET'])
+''' HEADERS
+X-Frame-Options : 
+    éviter les attaques de clickjacking pour s'assurer que le contenu ne soit pas embarqué dans d'autres sites
+X-Content-Type-Options 
+    est un marqueur utilisé par le serveur pour indiquer que les types MIME annoncés dans les en-têtes Content-Type ne doivent pas être modifiés ou et suivis  
+'''
+httpResponseHeaderOptions = {
+    'X-Frame-Options': 'sameorigin', 
+    'X-Content-Type-Options': 'nosniff'
+}
+
+@app.route('/', methods=['GET', 'POST'])
 def test():
     return Response(response=json.dumps({"Status": "UP"}),
                     status=200,
+                    headers = httpResponseHeaderOptions,
                     mimetype='application/json')
 
-
-
-class SessionManager:
-    
-    def isExpiredSession(self, sessionId):
-        print("Flag before query")
-        print('La date est ', datetime.now())
-        session = mongo.db.sessions.count_documents({"id":{"$regex": sessionId +'.*', "$options" :'i'},"expiration": {'$gt': datetime.now()}})
-        print("Nombre de session trouvées ", session)
-        if session == 0:
-            return True
-        else :
-            return False
-  
-  
-    def base64_to_string_converter(self, authorizationHeader):
-        # The header is of form "Basic the_base_64_message"
-        sessionIdBase64 = authorizationHeader[5:len(authorizationHeader)]
-        base64_bytes = sessionIdBase64.encode('ascii')
-        sessionId_bytes = base64.b64decode(base64_bytes)
-        sessionId = sessionId_bytes.decode('ascii')
-        return sessionId
-
-
-    def isAuthorized(self, authorizationHeader): 
-        
-        if ( authorizationHeader != None ) :
-            # Check session validity
-            sessionId = self.base64_to_string_converter(authorizationHeader)
-            expiredSession = self.isExpiredSession(sessionId)
-            if ( not expiredSession ) :
-                return True
-            else :
-                return False
-        
-        else :
-            return False
-
-
-    def authorizedResponse(self, authorizationHeader, status20xResponse):
-        
-        failedAuthResponse = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
-
-        if ( authorizationHeader != None ) :
-            # Check session validity
-            sessionId = self.base64_to_string_converter(authorizationHeader)
-            expiredSession = self.isExpiredSession(sessionId)
-
-            if ( not expiredSession ) :
-                return Response(status20xResponse,
-                                status=200,
-                                mimetype='application/json')
-            else :
-                return Response(failedAuthResponse,
-                                status=401,
-                                mimetype='application/json')
-        
-        else :
-            return Response(failedAuthResponse,
-                            status=401,
-                            mimetype='application/json')
-
-
-sessMgr = SessionManager()
 
 '''
 
 ROUTES CITATIONS
 
-'''
 
+'''
 
 @app.route('/citations', methods=['GET'])
 def getAllCitations():
     
-    citations = mongo.db.citations.find({})
+    citations = mongo.db.citations.find({}, {'likers': 0, 'citationPoster': 0})
     response = dumps(citations)
 
     if 'Authorization' in request.headers:
@@ -145,8 +100,9 @@ def getAllCitations():
         return authorizedResponse
     
     else :
-        return Response(response,
+        return Response(response,   
                         status=200,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -156,6 +112,7 @@ def getCitationById(id):
     response = dumps(citation)
     return Response(response,
                     status=200,
+                    headers = httpResponseHeaderOptions,
                     mimetype='application/json')
 
 
@@ -164,17 +121,20 @@ def getCitationsByAuthor():
     requestBoby = request.get_json()
     authorToSearch = requestBoby.get('authorToSearch')
     citations = mongo.db.citations.find(
-        {"author":{"$regex": authorToSearch +'.*', "$options" :'i'}})
+        {"author":{"$regex": authorToSearch +'.*', "$options" :'i'}},
+        {'likers': 0, 'citationPoster': 0})
     
     response = dumps(citations)
     
     if len(citations.distinct("_id")) == 0 :
         return Response(response,
                         status=204,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
     else:
         return Response(response,
                         status=200,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 @app.route('/citations/recherche/string', methods=['POST'])
@@ -182,17 +142,20 @@ def getCitationsByCitation():
     requestBoby = request.get_json()
     stringToSearch = requestBoby.get('stringToSearch')
     citations = mongo.db.citations.find(
-        {"citation":{"$regex": stringToSearch +'.*', "$options" :'i'}})
+        {"citation":{"$regex": stringToSearch +'.*', "$options" :'i'}},
+        {'likers': 0, 'citationPoster': 0})
    
     response = dumps(citations)
 
     if len(citations.distinct("_id")) == 0:
         return Response(response,
                         status=204,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
     else:
         return Response(response,
                         status=200,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 @app.route('/citations/recherche/auteuretstring', methods=['POST'])
@@ -202,17 +165,20 @@ def getCitationsByAuthorAndString():
     stringToSearch = requestBoby.get('stringToSearch')
     citations = mongo.db.citations.find(
         {"author":{"$regex": authorToSearch +'.*', "$options" :'i'}, 
-        "citation":{"$regex": stringToSearch +'.*', "$options" :'i'}})
+        "citation":{"$regex": stringToSearch +'.*', "$options" :'i'}},
+        {'likers': 0, 'citationPoster': 0})
     
     response = dumps(citations)
     
     if len(citations.distinct("_id")) == 0 :
         return Response(response,
                         status=204,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
     else:
         return Response(response,
                         status=200,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -240,11 +206,12 @@ def getUser():
         try:
             checkPassword = ph.verify(passwordCorrect, passwordInput)
             session[loginInput] = loginInput
-            print("Une session s'ouvre pour ", loginInput, "(len=", len(loginInput), ")et vaut : ", session.get(loginInput))
-            print("session id = ", session.sid)
+            #print("Une session s'ouvre pour ", loginInput, "(len=", len(loginInput), ")et vaut : ", session.get(loginInput))
+            #print("session id = ", session.sid)
             response = json.dumps({"Detail": "Accepted - Matching login/password", "sid" : session.sid})
             return Response(response,
                             status=202,
+                            headers = httpResponseHeaderOptions,
                             mimetype='application/json')
         
         # Password not matching
@@ -252,6 +219,7 @@ def getUser():
             response = json.dumps({"Detail": "Forbidden - Not matching login/password"})
             return Response(response,
                             status=403,
+                            headers = httpResponseHeaderOptions,
                             mimetype='application/json')
     
 
@@ -260,6 +228,7 @@ def getUser():
         response = json.dumps({"Detail": "Not Found - Not existing user"})
         return Response(response,
                         status=404,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -267,7 +236,9 @@ def getUser():
 def postUser():
     requestBoby = request.get_json()
     login = requestBoby.get('login')
-        
+    mail = requestBoby.get('mail')
+
+    # We require only the pseudo to be unique, not the mail    
     findSameUserLogin = mongo.db.users.count_documents({"login": login})
     
     # Not already existing login
@@ -276,6 +247,7 @@ def postUser():
         insertUser = mongo.db.users.insert_one({
                 "login": login,
                 "password": password,
+                "mail": mail,
                 "role": 5
             })
     
@@ -285,6 +257,7 @@ def postUser():
         response = json.dumps({"Detail": "Created - User was inserted in database", "sid" : session.sid})
         return Response(response,
                         status=201,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
     # Already existing login
@@ -292,6 +265,7 @@ def postUser():
         response = json.dumps({"Detail": "Forbidden - Already existing user login"})
         return Response(response,
                         status=403,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -303,11 +277,13 @@ def endSession():
         if ( authorization != None ) :
             sessionId = sessMgr.base64_to_string_converter(authorization)    
             expiredSession = sessMgr.isExpiredSession(sessionId)
-            mongo.db.sessions.remove({"id": {"$regex": sessionId +'.*', "$options" :'i'}})
+            mongo.db.sessions.delete_many({"id": {"$regex": sessionId +'.*', "$options" :'i'}})
+            sessMgr.clearAllExpiredSessions()
 
             response = json.dumps({"Detail": "Session removed succesfully"})
             return Response(response,
                             status=200,
+                            headers = httpResponseHeaderOptions,
                             mimetype='application/json')
 
 
@@ -325,6 +301,7 @@ def isAuthorized():
     else :
         return Response(response,
                         status=401,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -346,6 +323,7 @@ def MesCitationFavByIPoster():
         response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
         return Response(response,
                         status=401,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -365,6 +343,7 @@ def MesCitationPostByIPoster():
         response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
         return Response(response,
                         status=401,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -373,18 +352,29 @@ def deleteCitationByIdAndPoster():
     requestBoby = request.get_json()
     citationId = ObjectId(requestBoby.get('citationId'))
     poster = requestBoby.get('Poster')
-    citation = mongo.db.citations.remove({"_id": citationId,"citationPoster":poster})
-    response = dumps(citation)
     
     if 'Authorization' in request.headers:
         authorizationHeader = request.headers['Authorization']
-        authorizedResponse = sessMgr.authorizedResponse(authorizationHeader, response)
-        return authorizedResponse
-    
+        authorized = sessMgr.isAuthorized(authorizationHeader)
+
+        if ( authorized ) :
+            mongo.db.citations.delete_many({"_id": citationId,"citationPoster":poster})
+            return Response(status=200,
+                            headers = httpResponseHeaderOptions,
+                            mimetype='application/json')
+        
+        else :
+            response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
+            return Response(response,
+                        status=401,
+                        headers = httpResponseHeaderOptions,
+                        mimetype='application/json')
+        
     else :
         response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
         return Response(response,
                         status=401,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -404,6 +394,7 @@ def addCitationByIdAndPosterToFav():
             response = dumps(citation)
             return Response(response,
                             status=200,
+                            headers = httpResponseHeaderOptions,
                             mimetype='application/json')
         else :
             response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
@@ -414,6 +405,7 @@ def addCitationByIdAndPosterToFav():
         response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
         return Response(response,
                         status=401,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -433,16 +425,19 @@ def deleteCitationByIdAndPosterToFav():
             response = dumps(citation)
             return Response(response,
                             status=200,
+                            headers = httpResponseHeaderOptions,
                             mimetype='application/json')
         else :
             response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
             return Response(response,
                         status=401,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
     else :
         response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
         return Response(response,
                         status=401,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
 
@@ -473,18 +468,101 @@ def createNewCitation():
             response = dumps(citation)
             return Response(response,
                             status=200,
+                            headers = httpResponseHeaderOptions,
                             mimetype='application/json')
         else :
             response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
             return Response(response,
                         status=401,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
     else :
         response = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
         return Response(response,
                         status=401,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
 
+
+@app.route('/resetpassword', methods=['POST'])
+def resetpassword():
+    requestBoby = request.get_json()
+    pseudo = requestBoby.get('login')
+    mailUser = requestBoby.get('mailUser')
+
+    findMatchingPseudoAndMail = mongo.db.users.count_documents({"login": pseudo, "mail": mailUser})
+    
+    if findMatchingPseudoAndMail == 1 :
+        newPwdUuid = str(uuid.uuid4())
+        response = mailMgr.sendMsg(pseudo, mailUser, newPwdUuid)
+        
+        newPwdUuidHashed = ph.hash(newPwdUuid)
+        updatedUser = mongo.db.users.update_one(
+            {'login': pseudo}, 
+            {"$set":
+                {"password": newPwdUuidHashed}
+            }
+        )
+
+        return response
+    
+    else :
+        response = json.dumps({"Detail": "Not Found - No matching found with these pseudo and mail"})
+        return Response(response,
+                        status=204,
+                        headers = httpResponseHeaderOptions,
+                        mimetype='application/json')
+    
+
+@app.route('/updatepassword', methods=['POST'])
+def updatepassword():
+    requestBoby = request.get_json()
+    login = requestBoby.get('login')
+    mailUser = requestBoby.get('mailUser')
+    currentPwd = requestBoby.get('currentPwd')
+    newPwd = requestBoby.get('newPwd')
+
+    # Login and pseudo matching
+    findMatchingPseudoAndMail = mongo.db.users.count_documents({"login": login, "mail": mailUser})
+
+    user = mongo.db.users.find({'login': login, "mail": mailUser})
+
+    # user found
+    if ( findMatchingPseudoAndMail == 1) and (login == user[0]['login'] ) :
+        passwordCorrect = user[0]['password']
+        
+        # Password matching
+        try:
+            checkPassword = ph.verify(passwordCorrect, currentPwd)
+            newPwdHashed = ph.hash(newPwd)
+            updatedUser = mongo.db.users.update_one(
+                {'login': login}, 
+                {"$set":
+                    {"password": newPwdHashed}
+                }
+            )
+            response = json.dumps({"Detail": "Updated"})
+            return Response(response,
+                            status=200,
+                            headers = httpResponseHeaderOptions,
+                            mimetype='application/json')
+        
+        # Password not matching
+        except exceptions.VerifyMismatchError:
+            response = json.dumps({"Detail": "Forbidden - Not matching login/password"})
+            return Response(response,
+                            status=403,
+                            headers = httpResponseHeaderOptions,
+                            mimetype='application/json')
+    
+
+    # user not found
+    else :
+        response = json.dumps({"Detail": "Not Found - Not existing user"})
+        return Response(response,
+                        status=404,
+                        headers = httpResponseHeaderOptions,
+                        mimetype='application/json')
 
 '''
 
@@ -541,12 +619,14 @@ def statCitations(stat):
         response = dumps(citation)
         return Response(response,
                         status=200,
+                        headers = httpResponseHeaderOptions,
                         mimetype='application/json')
     
     else :
         failedAuthResponse = json.dumps({"Detail": "Unauthorized - Not found valid session to access the ressource"})
         return Response(failedAuthResponse,
                             status=401,
+                            headers = httpResponseHeaderOptions,
                             mimetype='application/json')
 
 
